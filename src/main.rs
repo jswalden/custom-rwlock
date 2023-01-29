@@ -49,7 +49,7 @@ impl<T> Drop for Reader<'_, T> {
 
 /// Exposes exclusive mutable access to the value in an `RwLock`.
 struct Writer<'a, T> {
-    rwlock: &'a mut RwLock<T>,
+    rwlock: &'a RwLock<T>,
 }
 
 impl<T> Deref for Writer<'_, T> {
@@ -62,7 +62,7 @@ impl<T> Deref for Writer<'_, T> {
 
 impl<T> DerefMut for Writer<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.rwlock.value.get_mut()
+        unsafe { &mut *self.rwlock.value.get() }
     }
 }
 
@@ -98,21 +98,19 @@ impl<T> RwLock<T> {
     /// Acquire a shared reference to the `T` behind the lock.
     fn read(&self) -> Reader<T> {
         let state = &self.state;
+        let mut s = state.load(Ordering::Relaxed);
         loop {
-            let s = state.load(Ordering::Relaxed);
-
             // If there's a pending writer, or if we're maxed out on readers,
-            // wait til something changes.
+            // wait til a reader drops its reference or the sole writer drops
+            // its reference.
             if s == u32::MAX || s == Self::MAX_READERS {
                 atomic_wait::wait(state, s);
                 continue;
             }
 
-            if state
-                .compare_exchange(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Reader { rwlock: self };
+            match state.compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return Reader { rwlock: self },
+                Err(curr) => s = curr,
             }
         }
     }
@@ -120,22 +118,12 @@ impl<T> RwLock<T> {
     /// Acquire an exclusive reference to the `T` behind the lock.
     fn write(&self) -> Writer<T> {
         let state = &self.state;
-        loop {
-            let s = state.load(Ordering::Relaxed);
-            if s != 0 {
-                atomic_wait::wait(state, s);
-                continue;
-            }
-
-            if state
-                .compare_exchange(0, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Writer {
-                    rwlock: unsafe { &mut *(self as *const Self as *mut Self) },
-                };
-            }
+        while let Err(curr) =
+            state.compare_exchange(0, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+        {
+            atomic_wait::wait(state, curr);
         }
+        Writer { rwlock: self }
     }
 }
 
